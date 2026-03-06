@@ -17,7 +17,7 @@ from util.net_utils import set_logger, set_random_seed
 from util.net_utils import compute_h_score_with_private_discovery, Entropy, label_matching
 
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score, confusion_matrix
+from sklearn.metrics import confusion_matrix
 from sklearn.manifold import TSNE
 
 
@@ -221,140 +221,37 @@ def save_metrics_curve(metrics, save_dir):
     plt.close()
 
 
-best_score = 0.0
-best_coeff = 1.0
 best_KK = None
 
 
-def reset_global_kmeans_state():
-    global best_score, best_coeff, best_KK
-    best_score = 0.0
-    best_coeff = 1.0
+def reset_global_state():
+    global best_KK
     best_KK = None
 
 
 @torch.no_grad()
-def obtain_global_pseudo_labels(args, model, dataloader, epoch_idx=0.0):
+def obtain_feature_banks(args, model, dataloader):
     model.eval()
 
     data_num = len(dataloader.dataset)
     pred_cls_bank = torch.zeros(data_num, args.class_num).cuda()
-    gt_label_bank = torch.zeros(data_num, dtype=torch.long).cuda()
     embed_feat_bank = torch.zeros(data_num, args.embed_feat_dim).cuda()
 
-    args.logger.info("Generating one-vs-all global clustering pseudo labels...")
-
-    for _, x_test, y, _, idx in tqdm(dataloader, ncols=60):
+    for _, x_test, _, _, idx in tqdm(dataloader, ncols=60):
         x_test = x_test.cuda(non_blocking=True)
         idx = idx.cuda(non_blocking=True)
-        y = y.cuda(non_blocking=True)
 
         embed_feat, pred_cls = model(x_test, apply_softmax=True)
         pred_cls_bank[idx] = pred_cls
         embed_feat_bank[idx] = embed_feat
-        gt_label_bank[idx] = y
 
     embed_feat_bank = embed_feat_bank / (torch.norm(embed_feat_bank, p=2, dim=1, keepdim=True) + 1e-8)
-
-    global best_score, best_coeff, best_KK
-    if epoch_idx == 0.0:
-        embed_feat_bank_cpu = embed_feat_bank.cpu().numpy()
-        coeff_list = [0.25, 0.50, 1, 2, 3]
-        min_KK = max(2, args.shared_class_num)
-        for coeff in coeff_list:
-            KK = max(int(args.class_num * coeff), min_KK)
-            if data_num <= KK:
-                KK = max(1, data_num - 1)
-            if KK < min_KK or KK <= 1:
-                continue
-            kmeans = KMeans(n_clusters=KK, random_state=0).fit(embed_feat_bank_cpu)
-            sil_score = silhouette_score(embed_feat_bank_cpu, kmeans.labels_)
-            if sil_score > best_score:
-                best_score = sil_score
-                best_coeff = coeff
-                best_KK = KK
-
-    if best_KK is None:
-        if data_num <= 1:
-            best_KK = 1
-        else:
-            best_KK = max(args.shared_class_num, min(args.class_num, data_num - 1))
-
-    KK = best_KK
-
-    if epoch_idx == 0.0:
-        args.logger.info("Estimated target class num (KK): {} | best_coeff: {:.3f}".format(KK, best_coeff))
-
-    pos_topk_num = max(1, data_num // KK)
-    min_neg = KK
-    if data_num - pos_topk_num < min_neg:
-        pos_topk_num = max(1, data_num - min_neg)
-
-    sorted_pred_cls, sorted_pred_cls_idxs = torch.sort(pred_cls_bank, dim=0, descending=True)
-    pos_topk_idxs = sorted_pred_cls_idxs[:pos_topk_num, :].t()
-    neg_topk_idxs = sorted_pred_cls_idxs[pos_topk_num:, :].t()
-
-    pos_topk_idxs = pos_topk_idxs.unsqueeze(2).expand([-1, -1, args.embed_feat_dim])
-    neg_topk_idxs = neg_topk_idxs.unsqueeze(2).expand([-1, -1, args.embed_feat_dim])
-
-    embed_feat_bank_expand = embed_feat_bank.unsqueeze(0).expand([args.class_num, -1, -1])
-    pos_feat_sample = torch.gather(embed_feat_bank_expand, 1, pos_topk_idxs)
-
-    pos_cls_prior = torch.mean(sorted_pred_cls[:pos_topk_num, :], dim=0, keepdim=True).t()
-    pos_cls_prior = pos_cls_prior * (1.0 - args.rho) + args.rho
-
-    pos_feat_proto = torch.mean(pos_feat_sample, dim=1, keepdim=True)
-    pos_feat_proto = pos_feat_proto / torch.norm(pos_feat_proto, p=2, dim=-1, keepdim=True)
-
-    feat_proto_pos_simi = torch.zeros((data_num, args.class_num)).cuda()
-    feat_proto_max_idxs = torch.zeros((data_num, args.class_num)).cuda()
-
-    for cls_idx in range(args.class_num):
-        neg_feat_cls_sample_np = torch.gather(embed_feat_bank, 0, neg_topk_idxs[cls_idx, :]).cpu().numpy()
-
-        if neg_feat_cls_sample_np.shape[0] < 1:
-            cls_neg_feat_proto = pos_feat_proto[cls_idx, :].clone()
-        else:
-            k_neg = min(KK, neg_feat_cls_sample_np.shape[0])
-            faiss_kmeans = faiss.Kmeans(args.embed_feat_dim, k_neg, niter=100, verbose=False, min_points_per_centroid=1, gpu=False)
-            faiss_kmeans.train(neg_feat_cls_sample_np)
-            cls_neg_feat_proto = torch.from_numpy(faiss_kmeans.centroids).cuda()
-            cls_neg_feat_proto = cls_neg_feat_proto / torch.norm(cls_neg_feat_proto, p=2, dim=-1, keepdim=True)
-
-        cls_pos_feat_proto = pos_feat_proto[cls_idx, :]
-
-        cls_pos_feat_proto_simi = torch.einsum("nd, kd -> nk", embed_feat_bank, cls_pos_feat_proto)
-        cls_neg_feat_proto_simi = torch.einsum("nd, kd -> nk", embed_feat_bank, cls_neg_feat_proto)
-        cls_pos_feat_proto_simi = cls_pos_feat_proto_simi * pos_cls_prior[cls_idx]
-
-        cls_feat_proto_simi = torch.cat([cls_pos_feat_proto_simi, cls_neg_feat_proto_simi], dim=1)
-        feat_proto_pos_simi[:, cls_idx] = cls_feat_proto_simi[:, 0]
-        _, maxidxs = torch.max(cls_feat_proto_simi, dim=-1)
-        feat_proto_max_idxs[:, cls_idx] = maxidxs
-
-    psd_label_prior_simi = torch.einsum("nd, cd -> nc", embed_feat_bank, pos_feat_proto.squeeze(1))
-    psd_label_prior_idxs = torch.max(psd_label_prior_simi, dim=-1, keepdim=True)[1]
-    psd_label_prior = torch.zeros_like(psd_label_prior_simi).scatter(1, psd_label_prior_idxs, 1.0)
-
-    hard_psd_label_bank = (feat_proto_max_idxs == 0).float()
-    hard_psd_label_bank = hard_psd_label_bank * psd_label_prior
-
-    hard_label = torch.argmax(hard_psd_label_bank, dim=-1)
-    hard_label_unk = torch.sum(hard_psd_label_bank, dim=-1)
-    hard_label_unk = (hard_label_unk == 0)
-    hard_label[hard_label_unk] = args.class_num
-
-    hard_psd_label_bank[hard_label_unk, :] += 1.0
-    hard_psd_label_bank = hard_psd_label_bank / (torch.sum(hard_psd_label_bank, dim=-1, keepdim=True) + 1e-4)
-
-    return hard_psd_label_bank, pred_cls_bank, embed_feat_bank
+    return pred_cls_bank, embed_feat_bank
 
 
 def train(args, model, train_dataloader, test_dataloader, optimizer, epoch_idx=0.0):
     model.eval()
-    hard_psd_label_bank, pred_cls_bank, embed_feat_bank = obtain_global_pseudo_labels(
-        args, model, test_dataloader, epoch_idx
-    )
+    pred_cls_bank, embed_feat_bank = obtain_feature_banks(args, model, test_dataloader)
 
     model.train()
     local_KNN = args.local_K
@@ -378,8 +275,6 @@ def train(args, model, train_dataloader, test_dataloader, optimizer, epoch_idx=0
         iter_idx += 1
         idx = idx.cuda()
         x_train = x_train.cuda()
-
-        hard_psd_label = hard_psd_label_bank[idx]
 
         embed_feat, pred_cls = model(x_train, apply_softmax=True)
         embed_feat = embed_feat / (torch.norm(embed_feat, p=2, dim=-1, keepdim=True) + 1e-8)
@@ -408,10 +303,10 @@ def train(args, model, train_dataloader, test_dataloader, optimizer, epoch_idx=0
             torch.sum(neg_feat_simi[:, hard_neg_start_idx:hard_neg_start_idx + local_KNN], dim=-1) -
             torch.sum(pos_feat_simi, dim=-1)
         )
-        psd_pred_loss = torch.mean(torch.sum(-hard_psd_label * torch.log(pred_cls + 1e-5), dim=-1))
         knn_pred_loss = torch.mean(torch.sum(-nn_pred_cls * torch.log(pred_cls + 1e-5), dim=-1))
+        psd_pred_loss = torch.tensor(0.0, device=pred_cls.device)
 
-        loss = args.lam_psd * psd_pred_loss + args.lam_knn * knn_pred_loss + args.lam_reg * reg_pred_loss
+        loss = args.lam_knn * knn_pred_loss + args.lam_reg * reg_pred_loss
         lr_scheduler(optimizer, iter_idx, iter_max)
 
         optimizer.zero_grad()
@@ -419,7 +314,7 @@ def train(args, model, train_dataloader, test_dataloader, optimizer, epoch_idx=0
         optimizer.step()
 
         all_pred_loss_stack.append(loss.item())
-        psd_pred_loss_stack.append(psd_pred_loss.item())
+        psd_pred_loss_stack.append(float(psd_pred_loss.item()))
         knn_pred_loss_stack.append(knn_pred_loss.item())
         reg_pred_loss_stack.append(reg_pred_loss.item())
 
@@ -471,7 +366,7 @@ def test(args, model, dataloader, src_flg=False, return_details=False):
     acc = float(np.mean(gt_c == pred_c)) if len(gt_c) > 0 else 0.0
 
     if not return_details:
-        return novel_discovery_acc, acc
+        return h_score, known_acc, unknown_acc, novel_discovery_acc, acc
 
     details = {
         "gt_label_all": gt_label_all,
@@ -507,140 +402,16 @@ def build_target_optimizer(args, model):
     return optimizer
 
 
-def grid_search_target(args, target_train_loader, target_train_eval_loader):
-    if not hasattr(args, "lam_psd_list"):
-        args.lam_psd_list = [0.5, 1.0, 2.0]
-    if not hasattr(args, "lam_knn_list"):
-        args.lam_knn_list = [0.5, 1.0, 2.0]
-    if not hasattr(args, "lam_reg_list"):
-        args.lam_reg_list = [0.05, 0.1, 0.2]
-    if not hasattr(args, "local_K_list"):
-        args.local_K_list = [3, 5, 7]
-    if not hasattr(args, "rho_list"):
-        args.rho_list = [0.05, 0.1, 0.2]
-    if not hasattr(args, "w0_list"):
-        args.w0_list = [0.3, 0.4, 0.5]
-    if not hasattr(args, "grid_epochs"):
-        args.grid_epochs = max(1, min(3, args.epochs))
-
-    best = {
-        "score": -1.0,
-        "h": 0.0,
-        "known": 0.0,
-        "unknown": 0.0,
-        "ncd": 0.0,
-        "acc": 0.0,
-        "lam_psd": args.lam_psd,
-        "lam_knn": args.lam_knn,
-        "lam_reg": args.lam_reg,
-        "local_K": args.local_K,
-        "rho": args.rho,
-        "w_0": args.w_0,
-    }
-    records = []
-
-    args.logger.info("Grid search on target train set: lam_psd={}, lam_knn={}, lam_reg={}, local_K={}, rho={}, w0={}, epochs={}".format(
-        args.lam_psd_list, args.lam_knn_list, args.lam_reg_list,
-        args.local_K_list, args.rho_list, args.w0_list, args.grid_epochs
-    ))
-
-    orig_epochs = args.epochs
-    for lam_psd in args.lam_psd_list:
-        for lam_knn in args.lam_knn_list:
-            for lam_reg in args.lam_reg_list:
-                for local_K in args.local_K_list:
-                    for rho in args.rho_list:
-                        for w0 in args.w0_list:
-                            args.lam_psd = lam_psd
-                            args.lam_knn = lam_knn
-                            args.lam_reg = lam_reg
-                            args.local_K = int(local_K)
-                            args.rho = rho
-                            args.w_0 = w0
-                            args.epochs = args.grid_epochs
-
-                            reset_global_kmeans_state()
-                            model = build_target_model(args)
-                            optimizer = build_target_optimizer(args, model)
-
-                            for epoch_idx in range(args.grid_epochs):
-                                train(args, model, target_train_loader, target_train_loader, optimizer, epoch_idx)
-
-                            hscore, knownacc, unknownacc, ncd_acc, acc = test(
-                                args, model, target_train_eval_loader, src_flg=False
-                            )
-                            score = knownacc if args.target_private_class_num == 0 else hscore
-
-                            records.append({
-                                "lam_psd": lam_psd,
-                                "lam_knn": lam_knn,
-                                "lam_reg": lam_reg,
-                                "local_K": local_K,
-                                "rho": rho,
-                                "w_0": w0,
-                                "h_score": hscore,
-                                "known_acc": knownacc,
-                                "unknown_acc": unknownacc,
-                                "ncd_acc": ncd_acc,
-                                "acc": acc,
-                                "score": score
-                            })
-
-                            if (score > best["score"]) or (abs(score - best["score"]) < 1e-6 and knownacc > best["known"]):
-                                best.update({
-                                    "score": score,
-                                    "h": hscore,
-                                    "known": knownacc,
-                                    "unknown": unknownacc,
-                                    "ncd": ncd_acc,
-                                    "acc": acc,
-                                    "lam_psd": lam_psd,
-                                    "lam_knn": lam_knn,
-                                    "lam_reg": lam_reg,
-                                    "local_K": local_K,
-                                    "rho": rho,
-                                    "w_0": w0
-                                })
-
-                            del model, optimizer
-                            torch.cuda.empty_cache()
-
-    args.epochs = orig_epochs
-
-    csv_path = os.path.join(args.save_dir, "target_grid_search.csv")
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "lam_psd", "lam_knn", "lam_reg", "local_K", "rho", "w_0",
-            "h_score", "known_acc", "unknown_acc", "ncd_acc", "acc", "score"
-        ])
-        for r in records:
-            writer.writerow([
-                r["lam_psd"], r["lam_knn"], r["lam_reg"], r["local_K"], r["rho"], r["w_0"],
-                r["h_score"], r["known_acc"], r["unknown_acc"], r["ncd_acc"], r["acc"], r["score"]
-            ])
-
-    args.logger.info("Grid search best: psd={:.3f}, knn={:.3f}, reg={:.3f}, K={}, rho={:.3f}, w0={:.3f}, score={:.3f}, H={:.3f}, Known={:.3f}".format(
-        best["lam_psd"], best["lam_knn"], best["lam_reg"], best["local_K"],
-        best["rho"], best["w_0"], best["score"], best["h"], best["known"]
-    ))
-    return best
-
-
 def main(args):
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     this_dir = os.path.join(os.path.dirname(__file__), ".")
 
-    if not hasattr(args, "lam_psd"):
-        args.lam_psd = 1.0
     if not hasattr(args, "lam_knn"):
         args.lam_knn = 1.0
     if not hasattr(args, "lam_reg"):
         args.lam_reg = 0.1
     if not hasattr(args, "local_K"):
         args.local_K = 5
-    if not hasattr(args, "rho"):
-        args.rho = 0.1
     if not hasattr(args, "w_0"):
         args.w_0 = 0.4
 
@@ -652,11 +423,11 @@ def main(args):
         raise ValueError("Please set source checkpoint for target adaptation.")
 
     model = model.cuda()
-    save_dir = os.path.join(this_dir, "checkpoints_glc_plus", args.dataset, "s_{}_t_{}".format(args.task, args.task),
+    save_dir = os.path.join(this_dir, "checkpoints_glc_plus", args.dataset, "model1",
                             args.target_label_type, args.note)
     os.makedirs(save_dir, exist_ok=True)
     args.save_dir = save_dir
-    args.logger = set_logger(args, log_name="log_target_training.txt")
+    args.logger = set_logger(args, log_name="log_model1_training.txt")
 
     target_dataset = BearingDataset(args, args.target_files, d_type="target")
     train_ratio = float(getattr(args, "target_train_ratio", 0.5))
@@ -670,30 +441,12 @@ def main(args):
 
     target_train_dataloader = DataLoader(target_train_dataset, batch_size=args.batch_size, shuffle=True,
                                          num_workers=args.num_workers, drop_last=True)
-    target_train_eval_dataloader = DataLoader(target_train_dataset, batch_size=args.batch_size * 2, shuffle=False,
-                                              num_workers=args.num_workers, drop_last=False)
     target_test_dataloader = DataLoader(target_test_dataset, batch_size=args.batch_size * 2, shuffle=False,
                                         num_workers=args.num_workers, drop_last=False)
 
-    # grid search on target train set
-    best = grid_search_target(args, target_train_dataloader, target_train_eval_dataloader)
-    args.lam_psd = best["lam_psd"]
-    args.lam_knn = best["lam_knn"]
-    args.lam_reg = best["lam_reg"]
-    args.local_K = best["local_K"]
-    args.rho = best["rho"]
-    args.w_0 = best["w_0"]
-
-    reset_global_kmeans_state()
+    reset_global_state()
     model = build_target_model(args)
-
-    param_group = []
-    for _, v in model.backbone_layer.named_parameters():
-        param_group += [{'params': v, 'lr': args.lr * 0.1}]
-    for _, v in model.feat_embed_layer.named_parameters():
-        param_group += [{'params': v, 'lr': args.lr}]
-    optimizer = torch.optim.SGD(param_group)
-    optimizer = op_copy(optimizer)
+    optimizer = build_target_optimizer(args, model)
 
     metrics = []
     best_score = -1.0
@@ -726,7 +479,7 @@ def main(args):
             best_epoch = epoch_idx + 1
             best_state = copy.deepcopy(model.state_dict())
             torch.save({"epoch": epoch_idx, "model_state_dict": model.state_dict()},
-                       os.path.join(save_dir, "best_target_checkpoint.pth"))
+                       os.path.join(save_dir, "best_model1_checkpoint.pth"))
 
     save_metrics_curve(metrics, save_dir)
 
@@ -752,7 +505,28 @@ def main(args):
     save_tsne_plot(details["embed_feat_all"].numpy(), pred_c,
                    os.path.join(viz_dir, "tsne_last_pred.png"))
 
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        hscore, knownacc, unknownacc, ncd_acc, acc, details = test(
+            args, model, target_test_dataloader, src_flg=False, return_details=True
+        )
+        gt_c, pred_c, label_ids, label_names = build_confusion_data(
+            args, details["pred_cls_all"], details["embed_feat_all"],
+            details["gt_label_all"], details["gt_private_all"]
+        )
+        cm = confusion_matrix(gt_c, pred_c, labels=label_ids)
+        np.savetxt(os.path.join(viz_dir, "confusion_best.csv"), cm, delimiter=",", fmt="%d")
+        save_confusion_matrix(cm, label_names, os.path.join(viz_dir, "confusion_best.png"), normalize=False)
+        save_confusion_matrix(cm, label_names, os.path.join(viz_dir, "confusion_best_norm.png"), normalize=True)
+        np.savetxt(os.path.join(viz_dir, "confusion_best_norm.csv"), cm.astype(np.float32) /
+                   (cm.sum(axis=1, keepdims=True) + 1e-6), delimiter=",", fmt="%.4f")
 
+        save_tsne_plot(details["embed_feat_all"].numpy(), gt_c,
+                       os.path.join(viz_dir, "tsne_best_gt.png"))
+        save_tsne_plot(details["embed_feat_all"].numpy(), pred_c,
+                       os.path.join(viz_dir, "tsne_best_pred.png"))
+
+    args.logger.info("Best epoch: {}".format(best_epoch))
 
 
 if __name__ == "__main__":
